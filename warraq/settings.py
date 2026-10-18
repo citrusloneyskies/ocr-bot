@@ -280,6 +280,31 @@ class RecognitionSettings(Section):
         "Self-check every region",
         "Compares the number of lines read with the lines on the page and detects runaway loops; failed regions are re-read in smaller pieces.",
     )
+    reread_doubtful: bool = opt(
+        True,
+        "Re-read doubtful lines",
+        "A line containing a letter the model was unsure of is read again on its own, a little larger, and the more confident reading is kept.",
+        show_if={"recognition.verify_and_retry": True},
+    )
+    doubt_threshold: float = opt(
+        0.12,
+        "Doubt threshold",
+        "A line is doubtful when the model's confidence in any single token falls below this. Higher re-reads more lines (slower, more careful).",
+        min=0.01,
+        max=0.6,
+        step=0.01,
+        advanced=True,
+        show_if={"recognition.verify_and_retry": True, "recognition.reread_doubtful": True},
+    )
+    mark_uncertain_below: float = opt(
+        0.35,
+        "Highlight words with confidence below",
+        "Words holding a letter the model was less sure of than this are underlined in the reading view for review.",
+        min=0.0,
+        max=0.95,
+        step=0.05,
+        advanced=True,
+    )
     flag_confidence_below: float = opt(
         0.55, "Flag regions with confidence below", "Flagged regions are highlighted for review.", min=0.0, max=1.0, step=0.05
     )
@@ -311,6 +336,12 @@ class TextSettings(Section):
     )
     strip_markup: bool = opt(True, "Remove stray HTML/Markdown from model output", advanced=True)
     collapse_repeats: bool = opt(True, "Remove runaway repetitions", advanced=True)
+    drop_foreign_scripts: bool = opt(
+        True,
+        "Remove characters of unrelated scripts",
+        "A stray Chinese or Korean character in the output is always a misread smudge; such lines are re-read and any left over removed.",
+        advanced=True,
+    )
     replacements: list[list[str]] = opt(
         [],
         "Find & replace rules",

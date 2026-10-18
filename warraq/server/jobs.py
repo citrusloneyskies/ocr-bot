@@ -340,6 +340,8 @@ class JobManager:
                     if text is not None:
                         r.text = text
                         r.edited = True
+                        # a corrected word is no longer in doubt; the others still await review
+                        r.uncertain = [w for w in r.uncertain if w in text]
                         _relayout_lines(r)
                     if kind is not None:
                         r.kind = kind

@@ -74,8 +74,10 @@ Every label, heading and separator can be changed in *Settings*, for example `[{
    enlarged to a consistent line height and padded with white. Paragraphs are read as blocks, and footnotes
    line by line so markers like `(٢)` stay on their own line.
 4. **Check everything.** Each block's line count is compared with the lines visible in the image, runaway loops
-   are stopped as they happen, and invented tails are caught. Anything suspicious is re-read line by line.
-   Low-confidence regions are flagged for review.
+   are stopped as they happen, and invented tails and stray characters from unrelated scripts are caught.
+   Anything suspicious is re-read line by line. Every line is also scored token by token: a line holding a
+   letter the model was unsure of is read again on its own, a little larger, and the more confident reading
+   wins. Low-confidence regions are flagged for review.
 5. **Assemble.** Footnotes are split into notes and labelled, `=` continuations are merged, marginal notes are
    labelled, and digits are made consistent through the book.
 
@@ -165,9 +167,11 @@ Inside the installed environment `warraq` is `.venv\Scripts\warraq.exe` (Windows
   footnote detection, straightening rotated notes, polygon masks, headers/footers/page numbers
   (keep labelled / remove / inline).
 - **Recognition**: prompt, decoding (greedy / beam / sampling), granularity (automatic / line by line / blocks),
-  block sizes, text-height normalisation, token budget, batch size, self-check and retry, confidence flagging.
+  block sizes, text-height normalisation, token budget, batch size, self-check and retry, re-reading doubtful
+  lines (with an adjustable doubt threshold), confidence flagging.
 - **Text clean-up**: diacritics, tatweel, presentation forms, digit style, punctuation spacing, line breaks
-  vs. paragraphs, and your own find-and-replace rules (with regex support).
+  vs. paragraphs, removal of stray characters from unrelated scripts, and your own find-and-replace rules (with
+  regex support).
 - **Footnotes**: section heading, label format, numbering (as printed / per page / continuous), label digits,
   continuation markers, merge or mark continuations, strip `=`, rewrite body markers `(١)` → `[1]`.
 - **Marginal notes**: heading, label format, side names, placement.

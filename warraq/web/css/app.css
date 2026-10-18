@@ -449,6 +449,11 @@ textarea.input { height: auto; min-height: 84px; padding: 10px 12px; resize: ver
   white-space: pre-wrap; word-break: break-word; outline: none; font-feature-settings: "kern", "liga", "calt";
 }
 .ar-text[contenteditable="true"]:focus { caret-color: var(--accent); }
+mark.unsure {
+  background: none; color: inherit; text-decoration: underline wavy color-mix(in oklab, var(--warn) 75%, transparent);
+  text-decoration-thickness: 1px; text-underline-offset: 7px; text-decoration-skip-ink: none; cursor: help;
+}
+mark.unsure:hover { background: color-mix(in oklab, var(--warn) 14%, transparent); border-radius: 4px; }
 .ar-text.title { font-weight: 700; font-size: calc(var(--ar-size, 21px) * 1.18); color: var(--accent); text-align: center; }
 .ar-text.small { font-size: calc(var(--ar-size, 21px) * .82); line-height: 1.95; }
 .ar-text.header { color: var(--text-2); font-size: calc(var(--ar-size, 21px) * .78); text-align: center; }

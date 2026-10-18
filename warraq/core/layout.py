@@ -276,6 +276,10 @@ def _expand_to_ink(regions: list[Region], ctx: PageContext) -> None:
             # blob must belong mostly to this region vertically (a line of this block)
             if G.v_overlap(box, r.bbox) < 0.6 * (box[3] - box[1]):
                 continue
+            # a horizontal text line forms a flat blob; a tall one is rotated or vertical
+            # writing (typically a marginal note) and must stay a region of its own
+            if (box[3] - box[1]) > 2.2 * lh and not (box[0] >= x0 and box[2] <= x1):
+                continue
             nx0, ny0 = min(nx0, box[0] - 2), min(ny0, box[1] - 2)
             nx1, ny1 = max(nx1, box[2] + 2), max(ny1, box[3] + 2)
         # never grow by more than a few line-heights sideways
@@ -297,7 +301,7 @@ def _recover_missed_text(regions: list[Region], ctx: PageContext, page_index: in
     # rules, frames and underlines are not text
     long_h = cv2.morphologyEx(free, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(lh * 2.5)), 1)))
     long_v = cv2.morphologyEx(free, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(10, int(lh * 2.5)))))
-    free = free * (1 - np.maximum(long_h, long_v))
+    free = free * (1 - np.maximum(_thin(long_h, lh, axis=0), _thin(long_v, lh, axis=1)))
     free = imaging.remove_specks(free, max(6, int(lh * lh * 0.01)))
     blobs = cv2.dilate(free, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(lh * 1.2)), max(3, int(lh * 0.8)))))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(blobs, connectivity=8)
@@ -310,28 +314,48 @@ def _recover_missed_text(regions: list[Region], ctx: PageContext, page_index: in
         if bx <= ctx.width * edge or by <= ctx.height * edge or bx + bw >= ctx.width * (1 - edge) or by + bh >= ctx.height * (1 - edge):
             continue  # touches the page edge: scanner border / bleed
         ink = free[by : by + bh, bx : bx + bw]
-        density = ink.mean()
-        if density < 0.02 or density > 0.55:
+        blob = labels[by : by + bh, bx : bx + bw] == i
+        # density inside the blob itself, so diagonal notes (sparse bounding boxes) still count
+        density = float((ink * blob).sum()) / max(1, int(blob.sum()))
+        if density < 0.03 or density > 0.6:
             continue  # empty-ish or a stain / picture
-        tight = imaging.tight_ink_box(ink)
+        tight = imaging.tight_ink_box(ink * blob)
         if tight is None or (tight[3] - tight[1]) < lh * 0.3:
             continue  # flat ink: leftovers of a rule or a border
         if bh < lh * 0.6 * 1.0 and bw > ctx.width * 0.5:
             continue  # a rule or frame line
         if bw * bh < (lh * 2) ** 2:
             continue
+        # the blob was dilated to join letters; the region itself hugs the ink, so it
+        # never reaches into the neighbouring text block
+        pad = lh * 0.25
+        box = G.clamp_box((bx + tight[0] - pad, by + tight[1] - pad, bx + tight[2] + pad, by + tight[3] + pad), ctx.width, ctx.height)
         found.append(
             Region(
                 id=f"p{page_index + 1}-x{i}",
                 kind=BODY,
                 label="recovered",
-                bbox=(float(bx), float(by), float(bx + bw), float(by + bh)),
+                bbox=tuple(float(v) for v in box),
                 score=0.5,
                 order=10_000 + i,
                 notes=["recovered"],
             )
         )
     return found
+
+
+def _thin(mask: np.ndarray, lh: float, axis: int) -> np.ndarray:
+    """Keep only the thin strokes of ``mask`` (rules are a few pixels thick; a dense
+    run of letters is not), measured across ``axis`` (0 = height, 1 = width)."""
+    if not mask.any():
+        return mask
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    limit = max(3, lh * 0.25)
+    keep = np.zeros(n, dtype=np.uint8)
+    for i in range(1, n):
+        thickness = stats[i, cv2.CC_STAT_HEIGHT] if axis == 0 else stats[i, cv2.CC_STAT_WIDTH]
+        keep[i] = 1 if thickness <= limit else 0
+    return keep[labels]
 
 
 def _main_box(regions: list[Region], ctx: PageContext):
@@ -382,6 +406,13 @@ def _classify_margins(regions: list[Region], ctx: PageContext, doc_type: str) ->
     for r in regions:
         if r.kind == MARGIN:
             r.side = _side(r, main, ctx)
+            continue
+        if r.kind == PAGE_NUMBER and main is not None:
+            # page numbers sit above or below the text; a "number" beside it, mid-page,
+            # is a short marginal note (collation marks such as بلغ, verse counts…)
+            if main[1] < r.cy < main[3] and (r.cx < main[0] or r.cx > main[2]):
+                r.kind = MARGIN
+                r.side = _side(r, main, ctx)
             continue
         if r.kind not in (BODY, TITLE) or main is None:
             continue

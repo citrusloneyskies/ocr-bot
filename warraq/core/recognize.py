@@ -22,10 +22,11 @@ from typing import Callable
 import numpy as np
 from PIL import Image, ImageDraw
 
+from ..models.ocr_model import weak_words
 from . import geometry as G
 from . import imaging
 from .document import FOOTER, FOOTNOTE, HEADER, MARGIN, PAGE_NUMBER, TABLE, TEXT_KINDS, Line, Region
-from .text import clean_model_output, html_to_text, strip_markdown
+from .text import clean_model_output, foreign_char_count, html_to_text, normalize_presentation_forms, strip_markdown
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,8 @@ class Chunk:
     text: str = ""
     ok: bool = True
     previous: "Chunk | None" = None  # earlier attempt of a re-read single line
+    doubt: list[int] = field(default_factory=list)  # lines holding a token the model was unsure of
+    patch_of: "tuple[Chunk, int] | None" = None  # (block, line index) this single-line re-read may replace
 
 
 @dataclass
@@ -91,8 +94,19 @@ class Recognizer:
                 for job in jobs:
                     new_chunks: list[Chunk] = []
                     for c in job.chunks:
-                        if c.ok or c.depth > depth:
+                        if c.depth > depth or (c.ok and not c.doubt):
                             new_chunks.append(c)
+                            continue
+                        if c.ok:
+                            # verified, but some line holds a letter the model was unsure of
+                            extra = self._reread_doubtful(job, c)
+                            c.doubt = []
+                            if len(c.bands) > 1:
+                                new_chunks.append(c)  # the block stays; re-read lines may patch it
+                            elif not extra:
+                                new_chunks.append(c)
+                            retry.extend(extra)
+                            new_chunks.extend(extra)
                             continue
                         replacement = self._split_or_rescale(job, c)
                         if replacement:
@@ -135,6 +149,10 @@ class Recognizer:
                 continue  # we are inside it; don't erase ourselves
             if G.containment(o.bbox, r.bbox) > 0.3:
                 pieces = [o.bbox]  # a block sitting inside our box (e.g. a margin note): erase it
+            elif o.kind == MARGIN and r.kind != MARGIN and _overlap_depth(o.bbox, r.bbox) <= 0.4 * (r.line_height or 30):
+                # a note whose box only grazes ours: the ink in that sliver is the note's, and
+                # leaving it would add a stray letter to the end of our lines
+                pieces = [o.bbox]
             else:
                 pieces = _box_difference(o.bbox, r.bbox)  # only erase what lies outside our own box
             for ox0, oy0, ox1, oy1 in pieces:
@@ -289,6 +307,7 @@ class Recognizer:
                 c.result = res
                 c.text = res.text
                 c.ok = self._verify(c)
+                c.doubt = self._doubtful_lines(c) if c.ok else []
             done += len(batch)
 
     def _verify(self, c: Chunk) -> bool:
@@ -307,6 +326,8 @@ class Recognizer:
             return False
         if expected >= 1 and not lines:
             return False
+        if self.settings.text.drop_foreign_scripts and foreign_char_count(raw):
+            return False  # a Chinese/Korean/… character means a misread: read it again
         # The model must not drop lines: small chunks get no tolerance at all,
         # large ones a little (line segmentation can over-count diacritic rows).
         tolerance = 0 if expected <= 4 else max(1, int(expected * 0.12))
@@ -322,6 +343,34 @@ class Recognizer:
                 return False
         return True
 
+    def _doubtful_lines(self, c: Chunk) -> list[int]:
+        """Indices of output lines whose weakest token is below the doubt threshold."""
+        rec = self.settings.recognition
+        res = c.result
+        if not (rec.verify_and_retry and rec.reread_doubtful) or c.region.kind == TABLE or res is None or not res.line_stats:
+            return []
+        if c.previous is not None:
+            return []  # already the second reading of this line
+        weak = [i for i, (low, _) in enumerate(res.line_stats) if low < rec.doubt_threshold]
+        if not weak:
+            return []
+        if len(c.bands) == 1:
+            return [0]
+        if "<" in (res.text or "") or len(res.line_stats) != len(c.bands):
+            return []  # lines cannot be matched to the image reliably
+        return weak
+
+    def _reread_doubtful(self, job: RegionJob, c: Chunk) -> list[Chunk]:
+        if len(c.bands) == 1:
+            return self._split_or_rescale(job, c) or []
+        out = []
+        for i in c.doubt:
+            nc = self._chunk_from_bands(job, [c.bands[i]], job.bands, c.depth + 1, c.variant, 0)
+            nc.order = c.order + (i + 1) / 1000.0
+            nc.patch_of = (c, i)
+            out.append(nc)
+        return out
+
     def _split_or_rescale(self, job: RegionJob, c: Chunk) -> list[Chunk] | None:
         if len(c.bands) >= 2:
             # a block that failed its self-check is re-read line by line
@@ -333,7 +382,7 @@ class Recognizer:
             return out
         if c.previous is None:
             # a single line that failed: read it once more, a little larger
-            nc = Chunk(c.region, c.order, c.bands, c.box, depth=c.depth + 1, variant=c.variant, previous=c)
+            nc = Chunk(c.region, c.order, c.bands, c.box, depth=c.depth + 1, variant=c.variant, previous=c, patch_of=c.patch_of)
             self._render_chunk(job, nc, extra_scale=1.3)
             return [nc]
         return None
@@ -341,19 +390,32 @@ class Recognizer:
     # ------------------------------------------------------------------ #
     def _finalize(self, job: RegionJob) -> None:
         r = job.region
-        chunks = sorted(job.chunks, key=lambda c: c.order)
         # for rescaled single-line retries keep whichever attempt is better
-        texts, conf_num, conf_den, flagged, notes = [], 0.0, 0, False, []
+        chunks = [_best_attempt(c) for c in sorted(job.chunks, key=lambda c: c.order)]
+        patches: dict[int, dict[int, Chunk]] = {}
         for c in chunks:
-            prev = c.previous
-            if prev is not None and prev.result is not None and c.result is not None:
-                if _chunk_score(prev) > _chunk_score(c):
-                    c = prev
+            if c.patch_of is not None:
+                block, i = c.patch_of
+                patches.setdefault(id(block), {})[i] = c
+        texts, conf_num, conf_den, flagged, notes, unsure = [], 0.0, 0, False, [], []
+        mark_below = self.settings.recognition.mark_uncertain_below
+        for c in chunks:
+            if c.patch_of is not None:
+                continue
             res = c.result
             if res is None:
                 flagged = True
                 continue
-            cleaned, cn = clean_model_output(res.text, self.settings)
+            raw, replaced = res.text, {}
+            if id(c) in patches:
+                raw, replaced = _apply_patches(c, patches[id(c)])
+                if replaced:
+                    notes.append("re-read doubtful lines")
+            if mark_below > 0:
+                unsure.extend(w for i, w in weak_words(res.pieces, res.probs, mark_below) if i not in replaced)
+                for p in replaced.values():
+                    unsure.extend(w for _, w in weak_words(p.result.pieces, p.result.probs, mark_below))
+            cleaned, cn = clean_model_output(raw, self.settings)
             notes.extend(cn)
             texts.append(cleaned)
             if res.confidence is not None:
@@ -375,6 +437,7 @@ class Recognizer:
             r.angle -= 360
         threshold = self.settings.recognition.flag_confidence_below
         r.flagged = flagged or (r.confidence is not None and r.confidence < threshold)
+        r.uncertain = _review_words(unsure, r.text)
         r.line_height = job.line_height
         keep = [n for n in r.notes if n.startswith("lines:") or n in ("starts_with_equals", "ends_with_equals", "recovered")]
         r.notes = keep + sorted(set(notes))
@@ -415,22 +478,92 @@ class Recognizer:
         return out
 
 
+def _line_score(stats: list[tuple[float, float]]) -> float:
+    """Mean log-probability, pulled down by the single weakest token."""
+    if not stats:
+        return -1e9
+    low = min(p for p, _ in stats)
+    mean = sum(m for _, m in stats) / len(stats)
+    return mean + 0.1 * math.log(max(low, 1e-4))
+
+
+def _best_attempt(c: Chunk) -> Chunk:
+    prev = c.previous
+    if prev is not None and prev.result is not None and c.result is not None and _chunk_score(prev) > _chunk_score(c):
+        return prev
+    return c
+
+
+def _single_line(text: str) -> str:
+    if "<" in text:
+        text = html_to_text(text)
+    return " ".join(strip_markdown(text).split())
+
+
+def _apply_patches(block: Chunk, patches: dict[int, Chunk]) -> tuple[str, dict[int, Chunk]]:
+    """Replace lines of a block reading with their single-line re-reads where those are
+    more confident.  Returns the raw text and the re-reads that were used, by line."""
+    res = block.result
+    raw = res.text or ""
+    stats = res.line_stats
+    replace: dict[int, str] = {}
+    used: dict[int, Chunk] = {}
+    lines = [l for l in raw.split("\n") if l.strip()]
+    for i, p in patches.items():
+        pr = p.result
+        if pr is None or not p.ok or i >= len(lines) or i >= len(stats):
+            continue
+        new = _single_line(pr.text or "")
+        old = lines[i].strip()
+        if not new or not 0.5 <= len(new) / max(1, len(old)) <= 2.0:
+            continue  # a re-read that lost or invented half the line is no improvement
+        if _line_score(pr.line_stats) > _line_score([stats[i]]):
+            replace[i] = new
+            used[i] = p
+    if not replace:
+        return raw, {}
+    out, k = [], 0
+    for line in raw.split("\n"):
+        if line.strip():
+            line = replace.get(k, line)
+            k += 1
+        out.append(line)
+    return "\n".join(out), used
+
+
+_EDGE_PUNCT = " \t.,،؛:;!?؟\"'«»()[]{}<>-–—…*/\\|"
+
+
+def _review_words(words: list[str], text: str) -> list[str]:
+    """Uncertain words as they appear in the final text (deduplicated, punctuation trimmed)."""
+    out: list[str] = []
+    for w in words:
+        w = normalize_presentation_forms(w).strip(_EDGE_PUNCT)
+        if len(w) < 1 or w in out or w not in text or not any(ch.isalnum() for ch in w):
+            continue
+        out.append(w)
+    return out[:300]
+
+
 def _chunk_score(c: Chunk) -> float:
     res = c.result
     if res is None:
         return -1e9
     s = res.confidence or 0.0
+    if res.line_stats:
+        s += 0.1 * math.log(max(1e-4, min(p for p, _ in res.line_stats)))
     if res.looped:
         s -= 1.0
     if res.hit_limit:
         s -= 0.5
     if not c.ok:
         s -= 0.25
+    s -= 0.2 * min(3, foreign_char_count(res.text or ""))
     return s
 
 
 def _job_score(job: RegionJob) -> float:
-    scores = [_chunk_score(c) for c in job.chunks]
+    scores = [_chunk_score(_best_attempt(c)) for c in job.chunks if c.patch_of is None]
     return sum(scores) / len(scores) if scores else -1e9
 
 
@@ -509,6 +642,13 @@ def _blocks(bands: list, max_size: int, min_size: int) -> list[list]:
     if len(groups) > 1 and len(groups[-1]) < min_size:
         groups[-2].extend(groups.pop())
     return groups
+
+
+def _overlap_depth(a, b) -> float:
+    """How far two overlapping boxes reach into each other (the thinner side of their intersection)."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return max(0.0, min(w, h))
 
 
 def _box_difference(a, b) -> list[tuple[float, float, float, float]]:

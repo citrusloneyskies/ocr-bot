@@ -57,6 +57,7 @@ class Region:
     line_height: float = 0.0
     notes: list[str] = field(default_factory=list)  # diagnostics (retries, warnings)
     edited: bool = False
+    uncertain: list[str] = field(default_factory=list)  # words the model was unsure of, for review
 
     @property
     def width(self) -> float:

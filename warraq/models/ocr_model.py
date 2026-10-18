@@ -6,7 +6,7 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from PIL import Image
@@ -24,6 +24,10 @@ class Recognition:
     hit_limit: bool  # stopped because of the token budget
     looped: bool  # stopped by the repetition detector
     seconds: float = 0.0
+    # (weakest token probability, mean log-probability) of every non-empty output line
+    line_stats: list[tuple[float, float]] = field(default_factory=list)
+    pieces: list[str] = field(default_factory=list)  # decoded text of each generated token
+    probs: list[float] = field(default_factory=list)  # probability of each generated token
 
 
 def has_loop(ids: list[int]) -> bool:
@@ -50,6 +54,72 @@ def has_loop(ids: list[int]) -> bool:
         if ids[-period:] == ids[-2 * period : -period]:
             return True
     return False
+
+
+def line_stats(pieces: list[str], logprobs: list[float]) -> list[tuple[float, float]]:
+    """Per-line confidence from per-token pieces and log-probabilities.  A single
+    unsure token (one misread letter) shows up as a low minimum even when the
+    line's average looks fine."""
+    out: list[tuple[float, float]] = []
+    cur: list[float] = []
+    has_text = False
+    in_tag = False  # inside <table>-style markup: the model's formatting, not page text
+    for piece, lp in zip(pieces, logprobs):
+        for k, part in enumerate(piece.split("\n")):
+            if k > 0:  # the token ended a line
+                if has_text:
+                    out.append((math.exp(min(cur)), sum(cur) / len(cur)))
+                cur, has_text, in_tag = [], False, False
+            visible = []
+            for ch in part:
+                if ch == "<":
+                    in_tag = True
+                elif ch == ">":
+                    in_tag = False
+                elif not in_tag:
+                    visible.append(ch)
+            if visible:
+                cur.append(lp)
+                has_text = has_text or any(not ch.isspace() for ch in visible)
+    if has_text:
+        out.append((math.exp(min(cur)), sum(cur) / len(cur)))
+    return out
+
+
+def weak_words(pieces: list[str], probs: list[float], threshold: float) -> list[tuple[int, str]]:
+    """(line index, word) for every word holding a token below ``threshold``.
+    Lines are counted like ``line_stats`` (non-empty lines only); markup is skipped."""
+    out: list[tuple[int, str]] = []
+    line, word, low, in_tag, line_has_text = 0, [], 1.0, False, False
+
+    def flush():
+        nonlocal word, low
+        if word and low < threshold:
+            out.append((line, "".join(word)))
+        word, low = [], 1.0
+
+    for piece, p in zip(pieces, probs):
+        for ch in piece:
+            if ch == "\n":
+                flush()
+                if line_has_text:
+                    line += 1
+                line_has_text, in_tag = False, False
+            elif ch == "<":
+                flush()
+                in_tag = True
+            elif ch == ">":
+                in_tag = False
+            elif in_tag:
+                continue
+            elif ch.isspace():
+                flush()
+            else:
+                word.append(ch)
+                low = min(low, p)
+                line_has_text = True
+    flush()
+    return out
 
 
 class OCRModel:
@@ -240,6 +310,8 @@ class OCRModel:
                 text = processor.decode(trimmed, skip_special_tokens=True)
                 lp = logprobs[i][: len(trimmed)] if logprobs[i] else []
                 conf = math.exp(sum(lp) / len(lp)) if lp else None
+                pieces = self._pieces(trimmed) if lp else []
+                stats = line_stats(pieces, lp) if lp else []
                 results.append(
                     Recognition(
                         text=text,
@@ -248,9 +320,16 @@ class OCRModel:
                         hit_limit=budget_hit[i] and not stopped_loop[i],
                         looped=stopped_loop[i],
                         seconds=elapsed / batch,
+                        line_stats=stats,
+                        pieces=pieces,
+                        probs=[math.exp(v) for v in lp] if pieces else [],
                     )
                 )
             return results
+
+    def _pieces(self, ids: list[int]) -> list[str]:
+        tok = getattr(self.processor, "tokenizer", None) or self.processor
+        return tok.batch_decode([[t] for t in ids], skip_special_tokens=True)
 
     def _eos_ids(self) -> list[int]:
         cfg = getattr(self.model, "generation_config", None)

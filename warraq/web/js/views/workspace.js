@@ -8,6 +8,20 @@ import { toast, menu, bar } from "../components/ui.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
 const SIDE = { right: "right margin", left: "left margin", top: "top margin", bottom: "bottom margin" };
+const EDGE = /^([\s.,،؛:;!?؟"'«»()[\]{}<>\-–—…*/\\|]*)(.*?)([\s.,،؛:;!?؟"'«»()[\]{}<>\-–—…*/\\|]*)$/su;
+
+// Region text with the words the model was unsure of underlined for review.
+function markedText(text, unsure) {
+  if (!unsure || !unsure.length) return [text];
+  const words = new Set(unsure);
+  const out = [];
+  for (const part of text.split(/(\s+)/)) {
+    const m = part && EDGE.exec(part);
+    if (m && m[2] && words.has(m[2])) out.push(m[1], h("mark.unsure", { text: m[2], title: t("unsure") }), m[3]);
+    else if (part) out.push(part);
+  }
+  return out.filter(Boolean);
+}
 
 export class WorkspaceView {
   constructor(app, jobId) {
@@ -364,7 +378,7 @@ export class WorkspaceView {
   }
 
   block(r, variant = "", label = "", side = "") {
-    const text = h(`div.ar-text${variant ? "." + variant : ""}`, { contenteditable: "true", spellcheck: false, dir: "rtl", lang: "ar", text: r.text || "" });
+    const text = h(`div.ar-text${variant ? "." + variant : ""}`, { contenteditable: "true", spellcheck: false, dir: "rtl", lang: "ar" }, markedText(r.text || "", r.uncertain));
     const save = debounce(async () => {
       const value = text.innerText.replace(/ /g, " ").replace(/\n{3,}/g, "\n\n").trim();
       if (value === (r.text || "").trim()) return;

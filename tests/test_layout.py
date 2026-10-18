@@ -80,3 +80,38 @@ def test_refine_page_number():
     pn.text = "١٢"
     L.refine_after_ocr([pn], None, page)
     assert pn.kind == "page_number" and page.printed_number == "١٢"
+
+
+def test_number_beside_text_is_a_margin_note():
+    """A short vertical note mid-page that the detector calls "number" is a marginal note."""
+    gray = _page_with_text_blocks()
+    ctx = L.build_context(gray)
+    dets = [
+        Detection("text", 0.9, (145, 140, 825, 760), 1, None),
+        Detection("number", 0.6, (855, 290, 965, 400), 2, None),
+        Detection("number", 0.7, (470, 1300, 530, 1340), 3, None),  # a real folio number at the foot
+    ]
+    regions = L.analyze(dets, ctx, Settings(), 0)
+    by_box = {tuple(round(v) for v in x.bbox[:2]): x for x in regions}
+    note = [x for x in regions if x.bbox[0] > 840]
+    assert note and note[0].kind == MARGIN and note[0].side == "right", [(x.kind, x.bbox) for x in regions]
+    folio = [x for x in regions if x.bbox[1] > 1250]
+    assert all(x.kind != MARGIN for x in folio)
+
+
+def test_recovered_note_hugs_its_ink():
+    """Ink nobody detected becomes a region whose box stays close to the ink."""
+    w, h = 1000, 1000
+    img = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(img)
+    for i in range(8):
+        d.rectangle((300, 150 + i * 60, 900, 180 + i * 60), fill=0)
+    for i in range(4):  # an undetected note on the left: short words, like real text
+        for x in range(60, 220, 32):
+            d.rectangle((x, 300 + i * 40, x + 24, 318 + i * 40), fill=0)
+    ctx = L.build_context(np.asarray(img))
+    regions = L.analyze([Detection("text", 0.9, (295, 140, 905, 640), 1, None)], ctx, Settings(), 0)
+    notes = [x for x in regions if x.label == "recovered"]
+    assert len(notes) == 1 and notes[0].kind == MARGIN
+    x0, y0, x1, y1 = notes[0].bbox
+    assert 40 <= x0 <= 60 and 220 <= x1 <= 245 and y1 <= 300 + 3 * 40 + 18 + 25

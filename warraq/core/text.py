@@ -17,9 +17,9 @@ TO_ARABIC_INDIC = str.maketrans(WESTERN + PERSIAN_DIGITS, ARABIC_INDIC * 2)
 
 TATWEEL = "ـ"
 # Harakat, Quranic annotation marks, superscript alef and extended marks.
-DIACRITICS_RE = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۨ-ۭ࣓-ࣣ࣡-ࣿ]")
-BIDI_CONTROLS_RE = re.compile(r"[‎‏‪-‮⁦-⁩؜]")
-ZERO_WIDTH_RE = re.compile(r"[​﻿]")
+DIACRITICS_RE = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e8\u06ea-\u06ed\u08d3-\u08e1\u08e3-\u08ff]")
+BIDI_CONTROLS_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c]")
+ZERO_WIDTH_RE = re.compile(r"[\u200b\ufeff]")
 
 
 def to_western_digits(text: str) -> str:
@@ -174,6 +174,31 @@ def normalize_presentation_forms(text: str) -> str:
     return "".join(fix(c) for c in text)
 
 
+# Scripts that never occur in Arabic books (CJK, kana, Hangul, Indic, Thai, private use).
+# The model was trained from a Chinese base and sometimes emits one of these on a smudge.
+FOREIGN_SCRIPT_RE = re.compile(
+    r"[\u0900-\u0dff\u0e00-\u0eff\u1100-\u11ff\u2e80-\u2fdf\u3001-\u30ff\u3100-\u318f\u31a0-\u31ff"
+    r"\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7af\ue000-\uf8ff\uf900-\ufaff\ufffd]"
+)
+# full-width punctuation the model borrows from Chinese, mapped to its Arabic/ASCII equivalent
+_FULLWIDTH = {0xFF0C: "،", 0xFF1B: "؛", 0xFF1F: "؟", 0x3002: ".", 0x3001: "،", 0x3000: " "}
+_FULLWIDTH.update({cp: chr(cp - 0xFEE0) for cp in range(0xFF01, 0xFF5F) if cp not in _FULLWIDTH})
+
+
+def foreign_char_count(text: str) -> int:
+    return len(FOREIGN_SCRIPT_RE.findall(text.translate(_FULLWIDTH)))
+
+
+def drop_foreign_scripts(text: str) -> tuple[str, bool]:
+    """Map full-width punctuation to normal forms and delete characters of unrelated scripts."""
+    text = text.translate(_FULLWIDTH)
+    cleaned = FOREIGN_SCRIPT_RE.sub("", text)
+    if cleaned == text:
+        return text, False
+    cleaned = "\n".join(re.sub(r"  +", " ", l).strip() for l in cleaned.split("\n"))
+    return cleaned, True
+
+
 def remove_diacritics(text: str) -> str:
     return DIACRITICS_RE.sub("", text)
 
@@ -264,6 +289,10 @@ def clean_model_output(raw: str, settings) -> tuple[str, list[str]]:
         if changed:
             notes.append("removed repeated output")
         text = drop_stray_quotes(text)
+    if t.drop_foreign_scripts:
+        text, changed = drop_foreign_scripts(text)
+        if changed:
+            notes.append("removed misread characters")
     if t.normalize_presentation_forms:
         text = normalize_presentation_forms(text)
     if not t.keep_diacritics:
