@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw
 
 from . import geometry as G
 from . import imaging
-from .document import FOOTNOTE, MARGIN, TABLE, TEXT_KINDS, Line, Region
+from .document import FOOTER, FOOTNOTE, HEADER, MARGIN, PAGE_NUMBER, TABLE, TEXT_KINDS, Line, Region
 from .text import clean_model_output, html_to_text, strip_markdown
 
 log = logging.getLogger(__name__)
@@ -129,8 +129,8 @@ class Recognizer:
         for o in regions:
             if o is r or G.intersection_area(o.bbox, (cx0, cy0, cx1, cy1)) <= 0:
                 continue
-            if G.containment(o.bbox, r.bbox) > 0.6 and o.kind not in (MARGIN, FOOTNOTE):
-                continue  # nested piece of this region
+            if G.containment(o.bbox, r.bbox) > 0.6 and o.kind not in (MARGIN, FOOTNOTE, HEADER, FOOTER, PAGE_NUMBER):
+                continue  # nested piece of this region (e.g. a title inside a text block)
             if G.containment(r.bbox, o.bbox) > 0.9:
                 continue  # we are inside it; don't erase ourselves
             if G.containment(o.bbox, r.bbox) > 0.3:
@@ -157,6 +157,14 @@ class Recognizer:
                 gray = imaging.to_gray(crop)
         mask_arr = imaging.ink_mask(gray)
         bands = imaging.segment_lines(gray, mask_arr)
+        if bands:
+            # rules, underlines and separator lines confuse the reader: paint them out
+            erased = _erase_rules(crop, mask_arr, imaging.median_line_height(bands) or bands[0].height)
+            if erased is not None:
+                crop = erased
+                gray = imaging.to_gray(crop)
+                mask_arr = imaging.ink_mask(gray)
+                bands = imaging.segment_lines(gray, mask_arr) or bands
         if not bands:
             ink = imaging.tight_ink_box(mask_arr)
             if ink is None:
@@ -252,7 +260,7 @@ class Recognizer:
     def _run_chunks(self, chunks: list[Chunk], page_index: int) -> None:
         if not chunks:
             return
-        bs = max(1, self.settings.recognition.batch_size)
+        bs = self.settings.recognition.batch_size or _auto_batch(self.ocr)
         ordered = sorted(chunks, key=lambda c: c.image.size[0] * c.image.size[1])
         done = 0
         for i in range(0, len(ordered), bs):
@@ -424,6 +432,36 @@ def _chunk_score(c: Chunk) -> float:
 def _job_score(job: RegionJob) -> float:
     scores = [_chunk_score(c) for c in job.chunks]
     return sum(scores) / len(scores) if scores else -1e9
+
+
+def _erase_rules(img: Image.Image, mask: np.ndarray, line_height: float) -> Image.Image | None:
+    """White out long, thin, stand-alone horizontal strokes (rules, underlines).
+    Kashida/tatweel strokes are attached to letters, so they are never touched."""
+    import cv2
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    lh = max(8.0, float(line_height))
+    hits = [i for i in range(1, n) if stats[i, cv2.CC_STAT_WIDTH] >= 2.5 * lh and stats[i, cv2.CC_STAT_HEIGHT] <= max(4.0, 0.14 * lh)]
+    if not hits:
+        return None
+    arr = np.asarray(img.convert("RGB")).copy()
+    erase = np.isin(labels, hits)
+    # include the anti-aliased fringe of the stroke
+    erase = cv2.dilate(erase.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    arr[erase] = 255
+    return Image.fromarray(arr)
+
+
+def _auto_batch(ocr) -> int:
+    device = getattr(ocr, "device", "cpu") or "cpu"
+    if device == "cpu":
+        return 1
+    if device == "mps":
+        return 2
+    from ..models import hardware
+
+    mem = hardware.device_memory_gb(device) or 8
+    return 8 if mem >= 20 else 6 if mem >= 12 else 4 if mem >= 8 else 2
 
 
 def _isolate_line(img: Image.Image, top: int, bottom: int) -> Image.Image:

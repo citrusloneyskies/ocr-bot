@@ -237,6 +237,7 @@ textarea.input { height: auto; min-height: 84px; padding: 10px 12px; resize: ver
 .input:focus, .select:focus { border-color: color-mix(in oklab, var(--accent) 70%, transparent); box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 16%, transparent); background: var(--surface-2); }
 .select { appearance: none; padding-right: 34px; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>"); background-repeat: no-repeat; background-position: right 12px center; }
 .select option { background: var(--panel-solid); color: var(--text); }
+.select:disabled, .input:disabled { opacity: .45; cursor: not-allowed; }
 [dir="rtl"] .select { padding-right: 12px; padding-left: 34px; background-position: left 12px center; }
 
 /* toggle */
@@ -247,6 +248,8 @@ textarea.input { height: auto; min-height: 84px; padding: 10px 12px; resize: ver
 .toggle input:checked + .track { background: linear-gradient(180deg, var(--accent-2), var(--accent)); border-color: transparent; }
 .toggle input:checked ~ .knob { transform: translateX(16px); }
 .toggle input:focus-visible + .track { box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 22%, transparent); }
+[dir="rtl"] .toggle .knob { left: auto; right: 3px; }
+[dir="rtl"] .toggle input:checked ~ .knob { transform: translateX(-16px); }
 
 /* segmented */
 .seg { display: inline-flex; padding: 3px; border-radius: 11px; background: var(--surface); border: 1px solid var(--border); gap: 2px; flex-wrap: wrap; }

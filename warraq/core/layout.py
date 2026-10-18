@@ -269,6 +269,10 @@ def _expand_to_ink(regions: list[Region], ctx: PageContext) -> None:
             inter = G.intersection_area(box, r.bbox)
             if inter <= 0:
                 continue
+            ink = win[by : by + bh, bx : bx + bw] * (labels[by : by + bh, bx : bx + bw] == i)
+            tight = imaging.tight_ink_box(ink)
+            if tight is None or (tight[3] - tight[1]) < lh * 0.3:
+                continue  # a rule or underline: never stretch a text box along it
             # blob must belong mostly to this region vertically (a line of this block)
             if G.v_overlap(box, r.bbox) < 0.6 * (box[3] - box[1]):
                 continue

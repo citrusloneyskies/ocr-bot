@@ -165,6 +165,7 @@ class Engine:
             else:
                 regions = L.full_page(ctx, settings, page.index)
             page.regions = regions
+            save_document(pages_dir.parent, doc)
             emit({"type": "layout", "page": page.to_dict()})
             control.check()
             recognizer.recognize_page(part.image, regions, page.index)

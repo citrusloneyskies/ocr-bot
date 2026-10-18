@@ -249,6 +249,9 @@ class JobManager:
                 job.message = f"Reading page {event.get('source_index', 0) + 1}"
             if t == "status":
                 job.message = event.get("message", job.message)
+            if t == "translate" and event.get("total"):
+                job.message = f"Translating {event.get('done', 0)}/{event['total']}"
+                self._emit(job, {"type": "status", "message": job.message})
             if t == "job":
                 event = {**event, "status": "running"}
             self._emit(job, event)

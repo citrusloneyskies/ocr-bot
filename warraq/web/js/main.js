@@ -299,7 +299,7 @@ class App {
     if (type === "model") {
       state.model = e;
       if (e.stage === "downloaded" || e.stage === "ready" || e.stage === "unloaded" || e.stage === "error") {
-        if (e.stage === "error") toast(e.message || "Model error", "err", 6000);
+        if (e.stage === "error" && !e.replay) toast(e.message || "Model error", "err", 6000);
         state.model = { stage: "idle" };
         this.refreshSystem();
       }
@@ -309,7 +309,8 @@ class App {
     }
     if (type === "job" && e.job) {
       upsertJob(e.job);
-      if (e.status === "done") {
+      if (e.replay) { /* history replayed on connect: update state silently */ }
+      else if (e.status === "done") {
         if (state.settings.general.notify_when_done) chime();
         const job = e.job;
         toast(`${job.name} — ${t("done")}`, "ok", 3600);
@@ -331,7 +332,7 @@ class App {
     if (type === "reading") state.reading[e.job_id] = { page: e.page, regions: e.regions };
     if (type === "page_done") delete state.reading[e.job_id];
     if (type === "translate") state.translate[e.job_id] = { done: e.done, total: e.total };
-    if (type === "log" && e.level === "error") toast(e.message, "err", 6000);
+    if (type === "log" && e.level === "error" && !e.replay) toast(e.message, "err", 6000);
     if (type === "export" && !this._exportToast) {
       this._exportToast = setTimeout(() => { this._exportToast = null; }, 1500);
     }

@@ -20,6 +20,11 @@ MODEL_FILE_PATTERNS = [
     "*.py",
     "*.yml",
 ]
+# training code, benchmarks, pictures and alternative weight formats are never needed
+IGNORE_PATTERNS = [
+    "train/*", "training/*", "examples/*", "example/*", "imgs/*", "images/*", "assets/*", "docs/*", "IFMTBench/*",
+    "onnx/*", "original/*", "*.gguf", "*.onnx", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.mp4", "*.pdf",
+]
 
 
 def configure_environment(model_settings) -> None:
@@ -55,6 +60,7 @@ def local_snapshot(model_id: str, model_settings, revision: str = "main") -> str
             revision=revision,
             cache_dir=_cache_dir(model_settings),
             allow_patterns=MODEL_FILE_PATTERNS,
+            ignore_patterns=IGNORE_PATTERNS,
             local_files_only=True,
         )
     except Exception:
@@ -81,6 +87,7 @@ def ensure_model(
         revision=revision,
         cache_dir=_cache_dir(model_settings),
         allow_patterns=MODEL_FILE_PATTERNS,
+        ignore_patterns=IGNORE_PATTERNS,
         token=model_settings.hf_token or None,
     )
     if tqdm_cls is not None:

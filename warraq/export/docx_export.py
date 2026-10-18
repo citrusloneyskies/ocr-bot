@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from docx import Document as DocxDocument
-from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -15,11 +14,49 @@ from ..core.document import TITLE
 from . import SIDE_WORDS
 
 
+# Child-element order required by the OOXML schema (ECMA-376); Word rejects files
+# whose properties are out of order.
+_PPR_ORDER = [
+    "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr", "suppressLineNumbers",
+    "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct", "topLinePunct",
+    "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing",
+    "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment", "textboxTightWrap", "outlineLvl",
+    "divId", "cnfStyle", "rPr", "sectPr", "pPrChange",
+]
+_RPR_ORDER = [
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow", "emboss",
+    "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs",
+    "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+    "specVanish", "oMath",
+]
+_SECTPR_ORDER = [
+    "headerReference", "footerReference", "footnotePr", "endnotePr", "type", "pgSz", "pgMar", "paperSrc", "pgBorders",
+    "lnNumType", "pgNumType", "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection", "bidi", "rtlGutter",
+    "docGrid", "printerSettings", "sectPrChange",
+]
+
+
+def _set_child(parent, name: str, order: list[str], attrs: dict | None = None):
+    """Add (or replace) w:<name> at its schema position inside ``parent``."""
+    tag = qn(f"w:{name}")
+    existing = parent.find(tag)
+    if existing is not None:
+        parent.remove(existing)
+    el = OxmlElement(f"w:{name}")
+    for k, v in (attrs or {}).items():
+        el.set(qn(f"w:{k}"), v)
+    later = set(order[order.index(name) + 1 :])
+    for i, child in enumerate(parent):
+        local = child.tag.split("}")[-1]
+        if local in later:
+            parent.insert(i, el)
+            return el
+    parent.append(el)
+    return el
+
+
 def _rtl_paragraph(p) -> None:
-    ppr = p._p.get_or_add_pPr()
-    bidi = OxmlElement("w:bidi")
-    bidi.set(qn("w:val"), "1")
-    ppr.append(bidi)
+    _set_child(p._p.get_or_add_pPr(), "bidi", _PPR_ORDER)
 
 
 def _arabic_run(p, text: str, font: str, size: float, bold: bool = False, color: RGBColor | None = None):
@@ -27,24 +64,18 @@ def _arabic_run(p, text: str, font: str, size: float, bold: bool = False, color:
     run.bold = bold
     run.font.size = Pt(size)
     run.font.name = font
+    if color is not None:
+        run.font.color.rgb = color
     rpr = run._r.get_or_add_rPr()
     fonts = rpr.find(qn("w:rFonts"))
     if fonts is None:
-        fonts = OxmlElement("w:rFonts")
-        rpr.append(fonts)
+        fonts = _set_child(rpr, "rFonts", _RPR_ORDER)
     for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
         fonts.set(qn(attr), font)
-    rtl = OxmlElement("w:rtl")
-    rtl.set(qn("w:val"), "1")
-    rpr.append(rtl)
-    szcs = OxmlElement("w:szCs")
-    szcs.set(qn("w:val"), str(int(size * 2)))
-    rpr.append(szcs)
     if bold:
-        bcs = OxmlElement("w:bCs")
-        rpr.append(bcs)
-    if color is not None:
-        run.font.color.rgb = color
+        _set_child(rpr, "bCs", _RPR_ORDER)
+    _set_child(rpr, "szCs", _RPR_ORDER, {"val": str(int(size * 2))})
+    _set_child(rpr, "rtl", _RPR_ORDER)
     return run
 
 
@@ -69,10 +100,7 @@ def render(views, settings, doc_model, translations: list[dict] | None = None):
     style = doc.styles["Normal"]
     style.font.name = font
     style.font.size = Pt(size)
-    sect = doc.sections[0]
-    sect_pr = sect._sectPr
-    bidi = OxmlElement("w:bidi")
-    sect_pr.append(bidi)
+    _set_child(doc.sections[0]._sectPr, "bidi", _SECTPR_ORDER)
     for i, v in enumerate(views):
         tr = translations[i] if translations else None
         if i > 0:

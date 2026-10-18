@@ -262,6 +262,7 @@ def translate_views(views, settings, emit: Callable[[dict], None] | None = None,
 
     translator = make_translator(settings, progress)
     translator.load()
+    emit({"type": "model", "stage": "ready", "device": getattr(translator, "device", "")})
     # work list: (page_idx, key, text)
     work: list[tuple[int, object, str]] = []
     for i, v in enumerate(views):

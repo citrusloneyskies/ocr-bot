@@ -269,11 +269,11 @@ class RecognitionSettings(Section):
         4_000_000, "Maximum pixels per crop", min=500_000, max=12_000_000, step=250_000, advanced=True
     )
     batch_size: int = opt(
-        1,
+        0,
         "Batch size",
-        "Regions recognised together on the GPU. Higher is faster with enough VRAM.",
-        min=1,
-        max=16,
+        "Lines/regions recognised together on the GPU. 0 = automatic (1 on CPU, 2–8 on GPUs depending on memory).",
+        min=0,
+        max=32,
     )
     verify_and_retry: bool = opt(
         True,

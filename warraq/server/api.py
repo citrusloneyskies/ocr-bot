@@ -348,7 +348,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
             try:
                 yield "retry: 1500\n\n"
                 for e in state.bus.recent()[-50:]:
-                    yield sse_format(e)
+                    yield sse_format({**e, "replay": True})
                 while True:
                     if await request.is_disconnected():
                         break
