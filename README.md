@@ -77,7 +77,7 @@ Every label, heading and separator can be changed in *Settings*, for example `[{
    or mix lines; reading whole paragraphs as blocks is available in *Settings*. A scrap of one or
    two words (a paragraph's last word, a short note) is set on a canvas as wide as a normal line, which stops
    the model from guessing.
-4. **Check everything.** Each block's line count is compared with the lines visible in the image, runaway loops
+4. **Check everything.** Every reading's line count is compared with the lines visible in the image, runaway loops
    are stopped as they happen (and cut back to a single copy), and invented tails and stray characters from
    unrelated scripts are caught. Anything suspicious is re-read line by line. Every line's length is checked
    against its width, so a line where the model skipped between two identical words, or repeated itself, is
@@ -176,7 +176,7 @@ Inside the installed environment `warraq` is `.venv\Scripts\warraq.exe` (Windows
 - **Layout analysis**: whole-page mode, document type, detection threshold, reading order, marginal-note and
   footnote detection, straightening rotated notes, polygon masks, headers/footers/page numbers
   (keep labelled / remove / inline).
-- **Recognition**: prompt, decoding (greedy / beam / sampling), granularity (automatic / line by line / blocks),
+- **Recognition**: prompt, decoding (greedy / beam / sampling), granularity (line by line / paragraphs as blocks),
   block sizes, text-height normalisation, token budget, batch size, self-check and retry, re-reading doubtful
   lines (with an adjustable doubt threshold), confidence flagging.
 - **Text clean-up**: diacritics, tatweel, presentation forms, digit style, punctuation spacing, quotation marks
