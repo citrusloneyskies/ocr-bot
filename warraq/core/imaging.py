@@ -158,7 +158,7 @@ def enhance(img: Image.Image, level: str = "auto", denoise: bool = False, binari
         lo, hi = np.percentile(norm, (0.5, 99.5))
         if hi - lo > 20:
             norm = np.clip((norm.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
-        out = norm
+        out = whiten_paper(norm)
         if level == "strong":
             lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -173,6 +173,36 @@ def enhance(img: Image.Image, level: str = "auto", denoise: bool = False, binari
         bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 15)
         out = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
     return Image.fromarray(out)
+
+
+def whiten_paper(arr: np.ndarray) -> np.ndarray:
+    """Turn the paper itself pure white (its grain and scanner noise included) while
+    leaving every ink tone exactly as it was, faint strokes and coloured rubrics too.
+    The reader then sees a clean page, and white padding around a line forms no edge."""
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY) if arr.ndim == 3 else arr
+    paper = float(np.median(gray))
+    above = gray[gray >= paper]
+    if above.size < 100 or paper < 140:
+        return arr  # mostly ink, or a dark page: leave it alone
+    noise = float(np.median(np.abs(above.astype(np.float32) - paper))) * 1.4826 + 1.0  # robust spread of the paper
+    cut = paper - 3.0 * noise  # lighter than this is paper
+    ramp = max(4.0, 2.0 * noise)  # values just below the paper fade to white, so strokes keep soft edges
+    if cut - ramp < 60:
+        return arr
+    levels = np.arange(256, dtype=np.float32)
+    lut = levels.copy()
+    fade = (levels > cut - ramp) & (levels < cut)
+    lut[fade] = (cut - ramp) + (levels[fade] - (cut - ramp)) * (255.0 - (cut - ramp)) / ramp
+    lut[levels >= cut] = 255.0
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        return lut[arr]
+    # scale every channel by the same per-pixel factor so coloured ink keeps its hue
+    g = np.maximum(gray.astype(np.float32), 1.0)
+    factor = lut[gray].astype(np.float32) / g
+    out = np.clip(arr.astype(np.float32) * factor[..., None], 0, 255)
+    out[lut[gray] >= 255] = 255
+    return out.astype(np.uint8)
 
 
 def find_spread_split(gray: np.ndarray, force: bool = False) -> int | None:
@@ -284,7 +314,55 @@ def segment_lines(gray: np.ndarray, mask: np.ndarray | None = None) -> list[Line
         first, second = merged[0], merged[1]
         merged[1] = LineBand(first.top, second.bottom, min(first.left, second.left), max(first.right, second.right))
         merged.pop(0)
+    # A band with almost no ink that is small both ways (a dot, a speck) is not a line: it
+    # joins its nearest neighbour.  A short last line ("ضعف.") is light too, but a word wide.
+    while len(merged) >= 2:
+        mass = [int(mask[b.top : b.bottom, b.left : b.right].sum()) for b in merged]
+        typical = float(np.median([b.height for b in merged]))
+        specks = [
+            k
+            for k, b in enumerate(merged)
+            if mass[k] < 0.08 * max(mass) and b.right - b.left < 0.75 * typical and b.height < 0.75 * typical
+        ]
+        if not specks:
+            break
+        i = min(specks, key=lambda k: mass[k])
+        _merge_into_neighbour(merged, i)
+    # A low fragment touching its line (a descender or a row of dots cut off at the
+    # baseline) belongs to that line.  A real short line sits across a line gap.
+    while len(merged) >= 2:
+        mass = [int(mask[b.top : b.bottom, b.left : b.right].sum()) for b in merged]
+        tallest = max(b.height for b in merged)
+        typical = float(np.median([b.height for b in merged]))
+        touch = max(3.0, 0.1 * typical)
+        frags = [
+            k
+            for k, b in enumerate(merged)
+            if b.height < 0.45 * tallest
+            and mass[k] < 0.2 * max(mass)
+            and min(
+                b.top - merged[k - 1].bottom if k > 0 else 1e9,
+                merged[k + 1].top - b.bottom if k + 1 < len(merged) else 1e9,
+            )
+            <= touch
+        ]
+        if not frags:
+            break
+        _merge_into_neighbour(merged, min(frags, key=lambda k: mass[k]))
     return merged
+
+
+def _merge_into_neighbour(bands: list[LineBand], i: int) -> None:
+    """Fold band ``i`` into the closer of its neighbours."""
+    b = bands.pop(i)
+    if i == 0:
+        j = 0
+    elif i == len(bands):
+        j = i - 1
+    else:
+        j = i - 1 if b.top - bands[i - 1].bottom <= bands[i].top - b.bottom else i
+    n = bands[j]
+    bands[j] = LineBand(min(n.top, b.top), max(n.bottom, b.bottom), min(n.left, b.left), max(n.right, b.right))
 
 
 def _estimate_line_pitch(profile: np.ndarray) -> float:
@@ -295,15 +373,29 @@ def _estimate_line_pitch(profile: np.ndarray) -> float:
         return max(8.0, n / 2)
     ac = np.correlate(p, p, mode="full")[n - 1 :]
     ac /= ac[0] if ac[0] else 1
-    lo = 6
-    hi = max(lo + 1, n // 2)
-    seg = ac[lo:hi]
-    if seg.size == 0:
-        return float(max(8, n))
-    # first clear local maximum
-    for i in range(1, len(seg) - 1):
-        if seg[i] > seg[i - 1] and seg[i] >= seg[i + 1] and seg[i] > 0.15:
-            return float(i + lo)
+    # Lines can't be closer together than their own ink is tall, so lags shorter than a
+    # typical run of inked rows are structure *inside* a line (baseline vs. dots row),
+    # not the line spacing.
+    inked = profile > profile.max() * 0.1
+    runs, start = [], None
+    for y, on in enumerate(inked):
+        if on and start is None:
+            start = y
+        elif not on and start is not None:
+            runs.append(y - start)
+            start = None
+    if start is not None:
+        runs.append(n - start)
+    lo = max(6, int(0.8 * np.median(runs))) if runs else 6
+    hi = min(n - 1, max(lo + 1, int(n * 0.75)))
+    peaks = [i for i in range(lo, hi) if ac[i] > ac[i - 1] and ac[i] >= ac[i + 1] and ac[i] > 0.15]
+    if peaks:
+        best = max(peaks, key=lambda i: ac[i])
+        # the fundamental, not a multiple of it, when its peak is nearly as strong
+        for i in peaks:
+            if i < best and ac[i] >= 0.8 * ac[best] and abs(best / i - round(best / i)) < 0.12:
+                return float(i)
+        return float(best)
     rows = np.where(profile > profile.max() * 0.1)[0]
     return float(max(8, (rows[-1] - rows[0] + 1) if rows.size else n))
 

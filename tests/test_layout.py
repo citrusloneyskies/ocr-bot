@@ -115,3 +115,51 @@ def test_recovered_note_hugs_its_ink():
     assert len(notes) == 1 and notes[0].kind == MARGIN
     x0, y0, x1, y1 = notes[0].bbox
     assert 40 <= x0 <= 60 and 220 <= x1 <= 245 and y1 <= 300 + 3 * 40 + 18 + 25
+
+
+def test_line_pitch_ignores_structure_inside_lines():
+    """Rows inside a line alternate dense/sparse (baseline, dots, stems): the pitch is the
+    line spacing, not that fine texture, even for blocks of only two or three lines."""
+    pitch = 98
+    profile = np.zeros(7 * pitch + 40)
+    for i in range(7):
+        top = 20 + i * pitch
+        for k in range(42):
+            profile[top + k] = 100 if (k // 5) % 2 == 0 else 30
+    for lines in (2, 3, 7):
+        assert imaging._estimate_line_pitch(profile[: lines * pitch + 20]) == pitch
+
+
+def test_whiten_paper_keeps_ink_and_colour():
+    rng = np.random.default_rng(0)
+    page = np.clip(rng.normal(228, 5, (200, 300, 3)), 0, 255).astype(np.uint8)  # grainy paper
+    page[50:60, 20:280] = (25, 25, 25)  # black ink
+    page[120:130, 20:280] = (200, 40, 40)  # red rubric
+    out = imaging.whiten_paper(page)
+    paper = np.concatenate([out[:40].reshape(-1, 3), out[150:].reshape(-1, 3)])
+    assert (paper == 255).mean() > 0.99
+    assert out[50:60, 20:280].max() < 60
+    r, g, b = out[120:130, 20:280].reshape(-1, 3).mean(axis=0)
+    assert r > 150 and g < 90 and b < 90
+
+
+def test_speck_is_not_a_line_but_a_short_last_line_is():
+    img = Image.new("L", (900, 260), 255)
+    d = ImageDraw.Draw(img)
+    for i in range(2):
+        for x in range(40, 860, 40):
+            d.rectangle((x, 30 + i * 80, x + 30, 70 + i * 80), fill=0)
+    d.rectangle((600, 200, 606, 206), fill=0)  # a speck below the text
+    assert len(imaging.segment_lines(np.asarray(img))) == 2
+    d.rectangle((700, 190, 860, 230), fill=0)  # a short last line beside it
+    assert len(imaging.segment_lines(np.asarray(img))) == 3
+
+
+def test_descender_cut_off_at_the_baseline_stays_with_its_line():
+    bands = [imaging.LineBand(42, 75, 21, 118), imaging.LineBand(75, 84, 93, 115)]
+    mask = np.zeros((130, 140), dtype=np.uint8)
+    mask[45:75, 21:118:3] = 1  # the word
+    mask[75:84, 93:115:4] = 1  # the tail of غ
+    merged = list(bands)
+    imaging._merge_into_neighbour(merged, 1)
+    assert merged == [imaging.LineBand(42, 84, 21, 118)]

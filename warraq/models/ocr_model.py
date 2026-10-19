@@ -30,12 +30,12 @@ class Recognition:
     probs: list[float] = field(default_factory=list)  # probability of each generated token
 
 
-def has_loop(ids: list[int]) -> bool:
-    """True if the tail of ``ids`` repeats itself: a short pattern many times, or a
-    long passage (a whole line or two) twice in a row — both are degenerate output."""
+def loop_period(ids: list[int]) -> int:
+    """Period of a loop at the tail of ``ids`` (0 if none): a short pattern repeated many
+    times, or a long passage (a whole line or two) twice in a row — degenerate output."""
     n = len(ids)
     if n < 16:
-        return False
+        return 0
     tail = ids[-160:]
     m = len(tail)
     for period in range(1, 41):
@@ -48,12 +48,28 @@ def has_loop(ids: list[int]) -> bool:
         seg = tail[-span:]
         unit = seg[:period]
         if all(seg[i] == unit[i % period] for i in range(span)):
-            return True
+            return period
     # long periods: the last `p` tokens equal the `p` tokens before them
     for period in range(41, min(400, n // 2) + 1):
         if ids[-period:] == ids[-2 * period : -period]:
-            return True
-    return False
+            return period
+    return 0
+
+
+def has_loop(ids: list[int]) -> bool:
+    return loop_period(ids) > 0
+
+
+def trim_loop(ids: list[int]) -> list[int]:
+    """Cut a detected loop back to a single copy of the repeated unit, so a line the
+    model read twice ("X X") is kept once."""
+    period = loop_period(ids)
+    if not period:
+        return ids
+    start = len(ids) - 2 * period
+    while start > 0 and ids[start - 1] == ids[start - 1 + period]:
+        start -= 1
+    return ids[: start + period]
 
 
 def line_stats(pieces: list[str], logprobs: list[float]) -> list[tuple[float, float]]:
@@ -307,6 +323,8 @@ class OCRModel:
                     if t in eos_ids:
                         break
                     trimmed.append(t)
+                if stopped_loop[i]:
+                    trimmed = trim_loop(trimmed)
                 text = processor.decode(trimmed, skip_special_tokens=True)
                 lp = logprobs[i][: len(trimmed)] if logprobs[i] else []
                 conf = math.exp(sum(lp) / len(lp)) if lp else None

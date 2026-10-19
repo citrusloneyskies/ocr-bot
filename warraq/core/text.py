@@ -114,8 +114,8 @@ def collapse_repetitions(text: str) -> tuple[str, bool]:
     text = re.sub(r"([^\s.\-_ـ=*])\1{11,}", r"\1", text)
     # 3. a phrase repeated back-to-back three or more times
     text = _collapse_phrase_loops(text)
-    # 4. identical lines repeated
-    lines = text.split("\n")
+    # 4. identical lines repeated; a line that starts over with a stray first letter
+    lines = [_drop_restart_letter(l) for l in text.split("\n")]
     out: list[str] = []
     for line in lines:
         if len(out) >= 2 and line.strip() and line.strip() == out[-1].strip() == out[-2].strip():
@@ -125,6 +125,38 @@ def collapse_repetitions(text: str) -> tuple[str, bool]:
     # 5. hyphen-joined number runs ("١٢٢-١٢٤-١٢٥-...") that the model invents
     text = re.sub(r"(?:[0-9٠-٩]{2,4}[-–]){8,}[0-9٠-٩]*\S*", "", text).rstrip()
     return text, text != original
+
+
+def trailing_echo(line: str) -> int:
+    """Number of words to drop when a line ends with its last 2-4 words said twice
+    ("وإن جاز استعماله جاز استعماله"), else 0.  Some texts repeat on purpose
+    ("الله أكبر الله أكبر"), so callers check the line's length before dropping."""
+    words = line.split()
+    for k in range(4, 1, -1):
+        if len(words) >= 2 * k + 1 and words[-k:] == words[-2 * k : -k]:
+            return k
+    return 0
+
+
+def trailing_restart(line: str) -> int:
+    """Number of words to drop when a line ends by starting itself over and getting cut
+    off ("… خلق عليها، باب الطه"), else 0.  Only meaningful for readings that were
+    stopped (loop or token budget): a finished line may well end like it began."""
+    words = line.split()
+    for k in range(min(4, len(words) // 3), 0, -1):
+        tail, head = words[-k:], words[:k]
+        if tail[:-1] == head[:-1] and head[-1].startswith(tail[-1]) and len(head[-1]) > len(tail[-1]):
+            return k
+    return 0
+
+
+def _drop_restart_letter(line: str) -> str:
+    """A lone letter after the end of a line that is the line's own first letter is
+    the model starting over ("… خلق عليها، ب"); no Arabic line ends in a lone letter."""
+    words = line.split()
+    if len(words) >= 4 and len(words[-1]) == 1 and words[-1] == words[0][0] and len(words[0]) > 1 and words[-1].isalpha():
+        return line.rstrip()[:-1].rstrip()
+    return line
 
 
 def _collapse_phrase_loops(text: str, min_unit: int = 6, min_repeats: int = 3) -> str:
@@ -228,6 +260,24 @@ def fix_punctuation_spacing(text: str) -> str:
     return "\n".join(lines)
 
 
+def convert_quotes(text: str, style: str) -> str:
+    """Straight double quotes → « », alternating open/close within each paragraph.
+    The model writes every quotation mark as a plain ", so this restores the book's style."""
+    if style != "guillemets" or '"' not in text:
+        return text
+    open_q, close_q = "«", "»"
+    out = []
+    for para in text.split("\n\n"):
+        chars, opened = [], False
+        for ch in para:
+            if ch == '"':
+                ch = close_q if opened else open_q
+                opened = not opened
+            chars.append(ch)
+        out.append("".join(chars))
+    return "\n\n".join(out)
+
+
 def apply_replacements(text: str, rules: Iterable[Iterable[str]]) -> str:
     for rule in rules or []:
         rule = list(rule)
@@ -305,6 +355,7 @@ def clean_model_output(raw: str, settings) -> tuple[str, list[str]]:
         text = to_arabic_digits(text)
     if t.fix_punctuation_spacing:
         text = fix_punctuation_spacing(text)
+    text = convert_quotes(text, t.quotes)
     text = apply_replacements(text, t.replacements)
     # tidy blank lines
     text = re.sub(r"[ \t]+\n", "\n", text)

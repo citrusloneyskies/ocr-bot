@@ -63,7 +63,8 @@ Every label, heading and separator can be changed in *Settings*, for example `[{
 ## How it reads a page
 
 1. **Prepare the page.** Rotate, remove dark scanner borders, split two-page spreads (right page first), straighten
-   skewed scans, and even out yellowed paper and shadows.
+   skewed scans, even out yellowed paper and shadows, and turn the paper's grain and scanner noise clean white
+   (only for reading: the searchable PDF keeps your original page images).
 2. **Find the parts of the page.** PP-DocLayoutV3 finds blocks. Warraq then:
    - grows each box so it never cuts a line,
    - recovers ink the detector missed,
@@ -71,13 +72,18 @@ Every label, heading and separator can be changed in *Settings*, for example `[{
    - marks blocks below the footnote rule, or set in smaller type at the foot of the page, as **footnotes**,
    - orders the body text right-to-left, column by column.
 3. **Read each region.** Rotated marginal notes are turned level, and both 180° orientations are tried. Text is
-   enlarged to a consistent line height and padded with white. Paragraphs are read as blocks, and footnotes
-   line by line so markers like `(٢)` stay on their own line.
+   enlarged to a consistent line height and padded with white. Text is read line by line (on a GPU many
+   lines at once), which keeps footnote markers like `(٢)` on their own line and never lets the model skip
+   or mix lines; reading whole paragraphs as blocks is available in *Settings*. A scrap of one or
+   two words (a paragraph's last word, a short note) is set on a canvas as wide as a normal line, which stops
+   the model from guessing.
 4. **Check everything.** Each block's line count is compared with the lines visible in the image, runaway loops
-   are stopped as they happen, and invented tails and stray characters from unrelated scripts are caught.
-   Anything suspicious is re-read line by line. Every line is also scored token by token: a line holding a
-   letter the model was unsure of is read again on its own, a little larger, and the more confident reading
-   wins. Low-confidence regions are flagged for review.
+   are stopped as they happen (and cut back to a single copy), and invented tails and stray characters from
+   unrelated scripts are caught. Anything suspicious is re-read line by line. Every line's length is checked
+   against its width, so a line where the model skipped between two identical words, or repeated itself, is
+   read again on its own. Every line is also scored token by token: a line holding a letter the model was
+   unsure of is read again, a little larger, and the better reading wins. Words that stay uncertain are
+   underlined for review, and doubtful regions are flagged.
 5. **Assemble.** Footnotes are split into notes and labelled, `=` continuations are merged, marginal notes are
    labelled, and digits are made consistent through the book.
 
@@ -91,6 +97,10 @@ Every label, heading and separator can be changed in *Settings*, for example `[{
 
 Intel Macs can't run current PyTorch releases. Translation with the default 1.8B model needs about 4 GB more
 GPU or unified memory. On smaller GPUs Warraq unloads the OCR model before translating.
+
+**Speed.** A GPU makes the biggest difference. As a rough guide, a full book page (20–25 lines) takes a few
+seconds on a recent NVIDIA GPU and somewhat longer on Apple Silicon. Without a GPU, expect two to three minutes
+per page on a 4-core CPU. Pages are saved as they finish, and long jobs can be paused and resumed.
 
 ## Install
 
@@ -169,9 +179,9 @@ Inside the installed environment `warraq` is `.venv\Scripts\warraq.exe` (Windows
 - **Recognition**: prompt, decoding (greedy / beam / sampling), granularity (automatic / line by line / blocks),
   block sizes, text-height normalisation, token budget, batch size, self-check and retry, re-reading doubtful
   lines (with an adjustable doubt threshold), confidence flagging.
-- **Text clean-up**: diacritics, tatweel, presentation forms, digit style, punctuation spacing, line breaks
-  vs. paragraphs, removal of stray characters from unrelated scripts, and your own find-and-replace rules (with
-  regex support).
+- **Text clean-up**: diacritics, tatweel, presentation forms, digit style, punctuation spacing, quotation marks
+  (restore « »), line breaks vs. paragraphs, removal of stray characters from unrelated scripts, and your own
+  find-and-replace rules (with regex support).
 - **Footnotes**: section heading, label format, numbering (as printed / per page / continuous), label digits,
   continuation markers, merge or mark continuations, strip `=`, rewrite body markers `(١)` → `[1]`.
 - **Marginal notes**: heading, label format, side names, placement.

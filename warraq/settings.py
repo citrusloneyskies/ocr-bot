@@ -227,10 +227,12 @@ class RecognitionSettings(Section):
         True, "Adaptive token budget", "Limit generation length to what the region can physically contain.", advanced=True
     )
     granularity: Literal["auto", "lines", "blocks"] = opt(
-        "auto",
+        "lines",
         "Reading granularity",
-        "Auto reads large paragraphs as blocks and everything else line by line. 'Line by line' is the most robust for manuscripts.",
-        labels={"auto": "Automatic (recommended)", "lines": "Line by line (most robust)", "blocks": "Blocks of lines (fastest)"},
+        "Line by line is the most reliable, and on a GPU much faster: lines are read in parallel batches. "
+        "Blocks give the reader a paragraph of context but can skip or mix lines; every block is checked and "
+        "re-read line by line when in doubt.",
+        labels={"lines": "Line by line (recommended)", "auto": "Paragraphs as blocks", "blocks": "Blocks of lines, always"},
     )
     max_lines_per_chunk: int = opt(
         12,
@@ -297,9 +299,10 @@ class RecognitionSettings(Section):
         show_if={"recognition.verify_and_retry": True, "recognition.reread_doubtful": True},
     )
     mark_uncertain_below: float = opt(
-        0.35,
+        0.5,
         "Highlight words with confidence below",
-        "Words holding a letter the model was less sure of than this are underlined in the reading view for review.",
+        "Words holding a letter the model was less sure of than this are underlined in the reading view for review. "
+        "0.7 underlines about half of all reading errors, at the cost of more false alarms.",
         min=0.0,
         max=0.95,
         step=0.05,
@@ -328,6 +331,12 @@ class TextSettings(Section):
         },
     )
     fix_punctuation_spacing: bool = opt(True, "Tidy spacing around punctuation")
+    quotes: Literal["keep", "guillemets"] = opt(
+        "keep",
+        "Quotation marks",
+        "The model writes every quotation mark as a straight \". If your book uses « », restore them here.",
+        labels={"keep": 'Straight " " (as read)', "guillemets": "Arabic « »"},
+    )
     line_mode: Literal["preserve", "paragraphs"] = opt(
         "preserve",
         "Line breaks",
@@ -524,7 +533,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "values": {
             "layout": {"document_type": "printed", "detect_footnotes": True, "detect_margin_notes": True},
             "input": {"enhance": "auto", "pdf_dpi": 300},
-            "recognition": {"max_lines_per_chunk": 12, "target_line_height": 76},
+            "recognition": {"granularity": "lines", "target_line_height": 76},
             "text": {"line_mode": "preserve"},
         },
     },
@@ -543,7 +552,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "Quick results for clean, modern print.",
         "values": {
             "input": {"enhance": "none", "pdf_dpi": 200, "deskew": False},
-            "recognition": {"granularity": "blocks", "max_lines_per_chunk": 24, "target_line_height": 0, "verify_and_retry": False, "batch_size": 4},
+            "recognition": {"granularity": "lines", "target_line_height": 0, "verify_and_retry": False, "batch_size": 0},
         },
     },
     "max_accuracy": {
@@ -551,7 +560,14 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "Slow and thorough: small chunks, large text, self-checks.",
         "values": {
             "input": {"pdf_dpi": 400, "enhance": "auto"},
-            "recognition": {"granularity": "lines", "target_line_height": 96, "verify_and_retry": True, "decoding": "greedy"},
+            "recognition": {
+                "granularity": "lines",
+                "target_line_height": 96,
+                "verify_and_retry": True,
+                "reread_doubtful": True,
+                "doubt_threshold": 0.2,
+                "decoding": "greedy",
+            },
         },
     },
 }

@@ -26,7 +26,15 @@ from ..models.ocr_model import weak_words
 from . import geometry as G
 from . import imaging
 from .document import FOOTER, FOOTNOTE, HEADER, MARGIN, PAGE_NUMBER, TABLE, TEXT_KINDS, Line, Region
-from .text import clean_model_output, foreign_char_count, html_to_text, normalize_presentation_forms, strip_markdown
+from .text import (
+    clean_model_output,
+    foreign_char_count,
+    html_to_text,
+    normalize_presentation_forms,
+    strip_markdown,
+    trailing_echo,
+    trailing_restart,
+)
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +58,8 @@ class Chunk:
     previous: "Chunk | None" = None  # earlier attempt of a re-read single line
     doubt: list[int] = field(default_factory=list)  # lines holding a token the model was unsure of
     patch_of: "tuple[Chunk, int] | None" = None  # (block, line index) this single-line re-read may replace
+    off_length: set[int] = field(default_factory=set)  # lines far too short/long for their width
+    density: float = 0.0  # the region's typical characters per pixel of line width
 
 
 @dataclass
@@ -71,6 +81,8 @@ class Recognizer:
         self.settings = settings
         self.progress = progress or (lambda e: None)
         self.cancel = cancel or (lambda: False)
+        # (region id, variant) -> (typical characters per pixel, widest line in pixels)
+        self.density: dict[tuple[str, str], tuple[float, float]] = {}
 
     # ------------------------------------------------------------------ #
     def recognize_page(self, page_img: Image.Image, regions: list[Region], page_index: int) -> None:
@@ -87,6 +99,9 @@ class Recognizer:
                 jobs.append(job.alt)
         all_chunks = [c for j in jobs for c in j.chunks]
         self._run_chunks(all_chunks, page_index)
+        self._learn_density(jobs)
+        for c in all_chunks:
+            self._check_length(c)
         # Self-check and retry
         if self.settings.recognition.verify_and_retry:
             for depth in range(4):
@@ -266,6 +281,11 @@ class Recognizer:
         if not target and extra_scale != 1.0:
             target = int(lh * extra_scale)
         img, scale = imaging.prepare_crop(sub, target, lh, rec.max_upscale * extra_scale, rec.max_pixels)
+        if len(chunk.bands) == 1 and chunk.bands[0].right - chunk.bands[0].left < 5 * lh:
+            # a scrap of one or two words: give it a normal line's proportions
+            pad = (img.height - round(sub.height * scale)) // 2
+            widest = max((b.right - b.left for b in job.bands), default=0)
+            img = _widen_short_line(img, int(max(widest, 12 * lh) * scale) + 2 * pad)
         chunk.image, chunk.scale = img, scale
         n = max(1, len(chunk.bands))
         width_ratio = (chunk.box[2] - chunk.box[0]) / max(8.0, lh)
@@ -308,6 +328,7 @@ class Recognizer:
                 c.text = res.text
                 c.ok = self._verify(c)
                 c.doubt = self._doubtful_lines(c) if c.ok else []
+                self._check_length(c)
             done += len(batch)
 
     def _verify(self, c: Chunk) -> bool:
@@ -335,6 +356,8 @@ class Recognizer:
             return False
         if expected >= 2 and len(lines) > expected * 1.6 + 1:
             return False
+        if expected >= 2 and _shared_run(lines, 6):
+            return False  # the same six words on two lines: the reader mixed lines up
         if expected >= 2 and len(lines) == expected:
             # a line far longer than its width allows = merged lines or an invented tail
             ratios = [len(t.strip()) / max(1, b.right - b.left) for t, b in zip(lines, c.bands)]
@@ -360,6 +383,36 @@ class Recognizer:
             return []  # lines cannot be matched to the image reliably
         return weak
 
+    def _learn_density(self, jobs: list[RegionJob]) -> None:
+        """Typical characters per pixel of line width, per region, from the first reading.
+        In one font a line's length follows its width closely, so a line far off that
+        ratio lost words (the model skipped between two identical words) or gained them."""
+        for job in jobs:
+            rows = [row for c in job.chunks for row in (_line_ratios(c) or [])]
+            if len(rows) < 3:
+                continue
+            widest = max(w for _, w, _ in rows)
+            usable = sorted(r for r, w, n in rows if w >= 0.3 * widest and n >= 8)
+            if len(usable) >= 3:
+                key = (job.region.id, job.chunks[0].variant if job.chunks else "")
+                self.density[key] = (usable[len(usable) // 2], widest)
+
+    def _check_length(self, c: Chunk) -> None:
+        rec = self.settings.recognition
+        if not (rec.verify_and_retry and rec.reread_doubtful) or not c.ok or c.previous is not None:
+            return
+        med, widest = self.density.get((c.region.id, c.variant), (0.0, 0.0))
+        rows = _line_ratios(c)
+        if not med or not rows:
+            return
+        # short lines hold too few letters to judge a shortfall; they can still be too long
+        off = {i for i, (r, w, n) in enumerate(rows) if (r > 1.35 * med) or (w >= 0.3 * widest and n >= 8 and r < 0.85 * med)}
+        if off and len(c.bands) > 1 and ("<" in (c.result.text or "") or len(c.result.line_stats) != len(c.bands)):
+            return  # block lines can't be matched to their re-reads
+        if off:
+            c.off_length, c.density = off, med
+            c.doubt = sorted(set(c.doubt) | ({0} if len(c.bands) == 1 else off))
+
     def _reread_doubtful(self, job: RegionJob, c: Chunk) -> list[Chunk]:
         if len(c.bands) == 1:
             return self._split_or_rescale(job, c) or []
@@ -368,6 +421,7 @@ class Recognizer:
             nc = self._chunk_from_bands(job, [c.bands[i]], job.bands, c.depth + 1, c.variant, 0)
             nc.order = c.order + (i + 1) / 1000.0
             nc.patch_of = (c, i)
+            nc.density = c.density
             out.append(nc)
         return out
 
@@ -382,8 +436,10 @@ class Recognizer:
             return out
         if c.previous is None:
             # a single line that failed: read it once more, a little larger
-            nc = Chunk(c.region, c.order, c.bands, c.box, depth=c.depth + 1, variant=c.variant, previous=c, patch_of=c.patch_of)
+            nc = Chunk(c.region, c.order, c.bands, c.box, depth=c.depth + 1, variant=c.variant, previous=c, patch_of=c.patch_of, density=c.density)
             self._render_chunk(job, nc, extra_scale=1.3)
+            if c.result is not None and c.result.hit_limit:
+                nc.budget = min(self.settings.recognition.max_new_tokens, int(c.budget * 1.6))  # dense line: room to finish
             return [nc]
         return None
 
@@ -411,6 +467,14 @@ class Recognizer:
                 raw, replaced = _apply_patches(c, patches[id(c)])
                 if replaced:
                     notes.append("re-read doubtful lines")
+            if c.off_length - set(replaced):
+                flagged = True  # a line whose length doesn't fit its width: words may be missing
+                notes.append("line length doubtful")
+            if self.settings.text.collapse_repeats:
+                density = self.density.get((c.region.id, c.variant), (0.0, 0.0))[0]
+                raw, trimmed = _trim_line_ends(c, raw, density)
+                if trimmed:
+                    notes.append("removed repeated line ending")
             if mark_below > 0:
                 unsure.extend(w for i, w in weak_words(res.pieces, res.probs, mark_below) if i not in replaced)
                 for p in replaced.values():
@@ -489,9 +553,48 @@ def _line_score(stats: list[tuple[float, float]]) -> float:
 
 def _best_attempt(c: Chunk) -> Chunk:
     prev = c.previous
-    if prev is not None and prev.result is not None and c.result is not None and _chunk_score(prev) > _chunk_score(c):
-        return prev
-    return c
+    if prev is None or prev.result is None or c.result is None:
+        return c
+    if prev.off_length and c.ok and prev.density:
+        # the first reading lost (or invented) words: prefer a re-read whose length fits
+        # the line, unless it is clearly less confident
+        new_off, old_off = _length_error(c, prev.density), _length_error(prev, prev.density)
+        if new_off < old_off - 0.05 and _chunk_score(c) >= _chunk_score(prev) - 0.3:
+            return c
+        if old_off < new_off - 0.05:
+            return prev
+    return prev if _chunk_score(prev) > _chunk_score(c) else c
+
+
+def _line_ratios(c: Chunk) -> list[tuple[float, float, int]] | None:
+    """(characters per pixel, line width, characters) for each line of a reading, when
+    its lines can be matched one-to-one with the line bands."""
+    res = c.result
+    if res is None or not c.bands:
+        return None
+    raw = res.text or ""
+    if "<" in raw:
+        if len(c.bands) > 1:
+            return None
+        raw = html_to_text(raw)
+    lines = [l.strip() for l in strip_markdown(raw).split("\n") if l.strip()]
+    if len(c.bands) == 1 and lines:
+        lines = [" ".join(lines)]
+    if len(lines) != len(c.bands):
+        return None
+    out = []
+    for text, b in zip(lines, c.bands):
+        w = max(1.0, float(b.right - b.left))
+        out.append((len(text) / w, w, len(text)))
+    return out
+
+
+def _length_error(c: Chunk, density: float) -> float:
+    """How far a single-line reading's length is from what its width predicts (log ratio)."""
+    rows = _line_ratios(c)
+    if not rows or not density:
+        return 9.0
+    return abs(math.log(max(rows[0][0], 1e-6) / density))
 
 
 def _single_line(text: str) -> str:
@@ -515,7 +618,19 @@ def _apply_patches(block: Chunk, patches: dict[int, Chunk]) -> tuple[str, dict[i
             continue
         new = _single_line(pr.text or "")
         old = lines[i].strip()
-        if not new or not 0.5 <= len(new) / max(1, len(old)) <= 2.0:
+        if not new:
+            continue
+        if i in block.off_length and block.density and i < len(block.bands):
+            # the block reading of this line lost or invented words: take the re-read if
+            # its length fits the line's width better and it is not clearly less sure
+            width = max(1.0, float(block.bands[i].right - block.bands[i].left))
+            err_new = abs(math.log(max(len(new), 1) / width / block.density))
+            err_old = abs(math.log(max(len(old), 1) / width / block.density))
+            if err_new < err_old - 0.05 and _line_score(pr.line_stats) >= _line_score([stats[i]]) - 0.3:
+                replace[i] = new
+                used[i] = p
+            continue
+        if not 0.5 <= len(new) / max(1, len(old)) <= 2.0:
             continue  # a re-read that lost or invented half the line is no improvement
         if _line_score(pr.line_stats) > _line_score([stats[i]]):
             replace[i] = new
@@ -529,6 +644,33 @@ def _apply_patches(block: Chunk, patches: dict[int, Chunk]) -> tuple[str, dict[i
             k += 1
         out.append(line)
     return "\n".join(out), used
+
+
+def _trim_line_ends(c: Chunk, raw: str, density: float) -> tuple[str, bool]:
+    """Drop what the model added after a line's real end: its last phrase said twice
+    (unless the line's width calls for that many letters) or, when the reading was cut
+    off, the start of the line over again."""
+    res = c.result
+    if "<" in raw:
+        raw = html_to_text(raw)
+    lines = raw.split("\n")
+    filled = [k for k, l in enumerate(lines) if l.strip()]
+    if not filled or len(filled) != len(c.bands):
+        return raw, False
+    changed = False
+    for j, k in enumerate(filled):
+        line = lines[k].strip()
+        n = trailing_echo(line)
+        if n and density:
+            shorter = " ".join(line.split()[:-n])
+            width = max(1.0, float(c.bands[j].right - c.bands[j].left))
+            if abs(math.log(len(shorter) / width / density)) < abs(math.log(len(line) / width / density)):
+                lines[k], line, changed = shorter, shorter, True
+        if j == len(filled) - 1 and res is not None and (res.hit_limit or res.looped):
+            n = trailing_restart(line)
+            if n:
+                lines[k], changed = " ".join(line.split()[:-n]), True
+    return "\n".join(lines), changed
 
 
 _EDGE_PUNCT = " \t.,،؛:;!?؟\"'«»()[]{}<>-–—…*/\\|"
@@ -597,6 +739,18 @@ def _auto_batch(ocr) -> int:
     return 8 if mem >= 20 else 6 if mem >= 12 else 4 if mem >= 8 else 2
 
 
+def _widen_short_line(img: Image.Image, width: int) -> Image.Image:
+    """Put a scrap of text (a paragraph's last word, a two-word note) on a canvas as wide
+    as a normal line, right-aligned like Arabic text.  On its own such a tiny image makes
+    the reader hallucinate (Chinese, English); at a normal line's proportions it reads it.
+    Longer short lines are left alone: widening them costs the model its diacritics."""
+    if img.width >= 0.8 * width:
+        return img
+    canvas = Image.new("RGB", (width, img.height), (255, 255, 255))
+    canvas.paste(img, (width - img.width, 0))
+    return canvas
+
+
 def _isolate_line(img: Image.Image, top: int, bottom: int) -> Image.Image:
     """Erase ink that belongs to the neighbouring lines (descenders from above,
     ascenders from below) from a single-line crop."""
@@ -642,6 +796,18 @@ def _blocks(bands: list, max_size: int, min_size: int) -> list[list]:
     if len(groups) > 1 and len(groups[-1]) < min_size:
         groups[-2].extend(groups.pop())
     return groups
+
+
+def _shared_run(lines: list[str], n: int) -> bool:
+    """True if any run of ``n`` consecutive words appears on two different lines."""
+    seen: dict[tuple[str, ...], int] = {}
+    for i, line in enumerate(lines):
+        words = line.split()
+        for j in range(len(words) - n + 1):
+            key = tuple(words[j : j + n])
+            if seen.setdefault(key, i) != i:
+                return True
+    return False
 
 
 def _overlap_depth(a, b) -> float:
